@@ -44,6 +44,41 @@ internal static class AudioDeviceManager
         }
     }
 
+    public static Boolean IsDefaultDevice(String deviceId, EDataFlow flow)
+    {
+        if (String.IsNullOrEmpty(deviceId))
+        {
+            return false;
+        }
+
+        var defaultDev = GetDefaultDevice(flow);
+        if (defaultDev is not { } current)
+        {
+            return false;
+        }
+
+        if (String.Equals(current.Key, deviceId, StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(current.Name, deviceId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (deviceId.IndexOf(current.Key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+            current.Key.IndexOf(deviceId, StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return true;
+        }
+
+        var devices = GetDevices(flow);
+        var match = devices.FirstOrDefault(d =>
+            String.Equals(d.Key, deviceId, StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(d.Name, deviceId, StringComparison.OrdinalIgnoreCase) ||
+            deviceId.IndexOf(d.Key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+            d.Key.IndexOf(deviceId, StringComparison.OrdinalIgnoreCase) >= 0);
+
+        return match.Key != null && String.Equals(match.Key, current.Key, StringComparison.OrdinalIgnoreCase);
+    }
+
     public static Boolean SetDefault(String deviceKey)
     {
         if (String.IsNullOrEmpty(deviceKey))

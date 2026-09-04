@@ -24,7 +24,7 @@ $dirsToClean = @("bin", "obj", $stagingDir, "src/bin", "src/obj")
 foreach ($dir in $dirsToClean) {
     if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
 }
-Get-ChildItem -Path . -Filter "${pluginName}*.lplug4" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+if (Test-Path $outputPackage) { Remove-Item $outputPackage -Force }
 
 # 2. Build
 Write-Host "`n=== Building Project ===" -ForegroundColor Cyan

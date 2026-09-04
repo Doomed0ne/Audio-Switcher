@@ -12,13 +12,13 @@ name: AudioSwitcher
 displayName: Audio Switcher
 
 # Short description of the plugin.
-description: Switch your Windows default audio device with a single button press.
+description: Switch audio devices and control per-app volume with the Volume Mixer.
 
 # Name of the plugin library file.
 pluginFileName: AudioSwitcherPlugin.dll
 
 # Plugin version.
-version: 1.1.1
+version: 1.2.27
 
 # Author of the plugin. The author can be a company or an individual developer.
 author: Joel Friesecke

@@ -1,6 +1,7 @@
 namespace Loupedeck.AudioSwitcherPlugin;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -9,8 +10,12 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
 {
     private readonly Timer _refreshTimer;
     private readonly Dictionary<String, AudioDeviceInfo> _devices = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Object _devicesLock = new();
+    private readonly ConcurrentDictionary<String, Byte> _loggedImageParameters = new(StringComparer.OrdinalIgnoreCase);
     private String _deviceSignature = "";
-    private String _currentDefaultKey;
+    private volatile String _currentDefaultKey;
+    private Int32 _imageRefreshPending = 1;
+    private Int32 _imageRefreshWarningLogged;
 
     protected AudioDeviceSwitchDynamicCommandBase(String displayName, String description)
         : base(displayName, description, "Audio")
@@ -24,8 +29,21 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
 
     protected override Boolean OnLoad()
     {
-        this.RefreshDevices(forceUiRefresh: true);
-        this._refreshTimer.Change(250, 1000);
+        try
+        {
+            this.RefreshDevices(forceUiRefresh: true);
+        }
+        catch (Exception ex)
+        {
+            // A transient service/profile startup error must not prevent future device
+            // refreshes. The timer retries initialization and the pending image redraw.
+            PluginLog.Warning(ex, $"{this.DisplayName} initial device refresh failed; the timer will retry.");
+        }
+        finally
+        {
+            this._refreshTimer.Change(250, 1000);
+        }
+
         return true;
     }
 
@@ -43,11 +61,10 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
             return;
         }
 
-        var oldDefaultKey = this._currentDefaultKey;
         if (AudioDeviceManager.SetDefault(deviceKey))
         {
             this._currentDefaultKey = deviceKey;
-            this.RefreshDeviceImages(oldDefaultKey, deviceKey);
+            this.TryNotifyImageChanged();
         }
         else
         {
@@ -58,9 +75,17 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
     protected override String GetCommandDisplayName(String actionParameter, PluginImageSize imageSize)
     {
         var deviceKey = this.ResolveDeviceKey(actionParameter);
-        return !String.IsNullOrEmpty(deviceKey) && this._devices.TryGetValue(deviceKey, out var device)
-            ? device.Name
-            : base.GetCommandDisplayName(actionParameter, imageSize);
+        if (String.IsNullOrEmpty(deviceKey))
+        {
+            return base.GetCommandDisplayName(actionParameter, imageSize);
+        }
+
+        lock (this._devicesLock)
+        {
+            return this._devices.TryGetValue(deviceKey, out var device)
+                ? device.Name
+                : base.GetCommandDisplayName(actionParameter, imageSize);
+        }
     }
 
     protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
@@ -71,18 +96,35 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
             return null;
         }
 
-        if (!this._devices.TryGetValue(deviceKey, out var device))
+        AudioDeviceInfo? device = null;
+        lock (this._devicesLock)
         {
-            device = AudioDeviceManager.GetDevices(this.DataFlow)
-                .FirstOrDefault(d => String.Equals(d.Key, deviceKey, StringComparison.OrdinalIgnoreCase));
+            if (this._devices.TryGetValue(deviceKey, out var cachedDevice))
+            {
+                device = cachedDevice;
+            }
         }
 
-        var isCurrent = String.Equals(
-            deviceKey,
-            this.ReadDefaultDeviceKey(),
-            StringComparison.OrdinalIgnoreCase);
+        var isCurrent = String.Equals(deviceKey, this._currentDefaultKey, StringComparison.OrdinalIgnoreCase);
+        var deviceName = device?.Name ?? deviceKey;
 
-        return this.BuildDeviceImage(deviceKey, device.Name, isCurrent, imageSize);
+        // Log each distinct parameter once. This proves whether the host requested an
+        // image for the tested action and whether its key matched the device cache.
+        var firstImageRequest = this._loggedImageParameters.TryAdd(actionParameter ?? "<empty>", 0);
+        if (firstImageRequest)
+        {
+            PluginLog.Info(
+                $"{this.DisplayName} image callback: parameter='{actionParameter}', resolvedKey='{deviceKey}', " +
+                $"deviceCached={device.HasValue}, defaultKey='{this._currentDefaultKey}', active={isCurrent}.");
+            if (!device.HasValue)
+            {
+                // Keep a valid action visible through startup/device-list races. The raw key
+                // is only a temporary label until the next timer refresh resolves its name.
+                PluginLog.Warning($"{this.DisplayName} image parameter '{actionParameter}' is not in the current device cache; rendering a fallback tile.");
+            }
+        }
+
+        return this.BuildDeviceImage(deviceKey, deviceName, isCurrent, imageSize);
     }
 
     private void OnTimerTick(Object state)
@@ -90,6 +132,11 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
         try
         {
             this.RefreshDevices(forceUiRefresh: false);
+
+            if (Volatile.Read(ref this._imageRefreshPending) != 0)
+            {
+                this.TryNotifyImageChanged();
+            }
         }
         catch (Exception ex)
         {
@@ -108,16 +155,21 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
         var signature = String.Join("|", devices.Select(d => $"{d.Key}:{d.Name}"));
         var deviceListChanged = !String.Equals(this._deviceSignature, signature, StringComparison.Ordinal);
         var defaultChanged = !String.Equals(this._currentDefaultKey, currentDefaultKey, StringComparison.OrdinalIgnoreCase);
-        var oldDefaultKey = this._currentDefaultKey;
 
         if (deviceListChanged)
         {
             this.RemoveAllParameters();
-            this._devices.Clear();
+            lock (this._devicesLock)
+            {
+                this._devices.Clear();
+                foreach (var device in devices)
+                {
+                    this._devices[device.Key] = device;
+                }
+            }
 
             foreach (var device in devices)
             {
-                this._devices[device.Key] = device;
                 this.AddParameter(device.Key, device.Name, this.DisplayName);
             }
 
@@ -127,28 +179,43 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
 
         this._currentDefaultKey = currentDefaultKey;
 
-        if (forceUiRefresh || deviceListChanged)
+        if (forceUiRefresh || deviceListChanged || defaultChanged)
         {
-            this.ActionImageChanged();
-        }
-        else if (defaultChanged)
-        {
-            this.RefreshDeviceImages(oldDefaultKey, currentDefaultKey);
+            this.TryNotifyImageChanged();
         }
     }
 
     private String ReadDefaultDeviceKey() => AudioDeviceManager.GetDefaultDevice(this.DataFlow)?.Key;
 
-    private void RefreshDeviceImages(String oldDefaultKey, String newDefaultKey)
+    private Boolean TryNotifyImageChanged()
     {
-        if (!String.IsNullOrEmpty(oldDefaultKey))
+        try
         {
-            this.ActionImageChanged(oldDefaultKey);
+            // The SDK explicitly documents an unscoped redraw for buttons currently
+            // shown on the device. Use that overload so the host's serialized parameter
+            // format cannot cause a targeted invalidation to miss the action.
+            this.ActionImageChanged();
+            Volatile.Write(ref this._imageRefreshPending, 0);
+            Interlocked.Exchange(ref this._imageRefreshWarningLogged, 0);
+            return true;
         }
-
-        if (!String.IsNullOrEmpty(newDefaultKey))
+        catch (NullReferenceException ex)
         {
-            this.ActionImageChanged(newDefaultKey);
+            Volatile.Write(ref this._imageRefreshPending, 1);
+            if (Interlocked.Exchange(ref this._imageRefreshWarningLogged, 1) == 0)
+            {
+                PluginLog.Warning(ex, $"{this.DisplayName} image redraw is not available yet; retrying after startup.");
+            }
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Volatile.Write(ref this._imageRefreshPending, 1);
+            if (Interlocked.Exchange(ref this._imageRefreshWarningLogged, 1) == 0)
+            {
+                PluginLog.Warning(ex, $"{this.DisplayName} image redraw failed; retrying on the next device refresh.");
+            }
+            return false;
         }
     }
 
@@ -159,16 +226,19 @@ public abstract class AudioDeviceSwitchDynamicCommandBase : PluginDynamicCommand
             return null;
         }
 
-        if (this._devices.ContainsKey(actionParameter))
+        lock (this._devicesLock)
         {
-            return actionParameter;
-        }
-
-        foreach (var key in this._devices.Keys)
-        {
-            if (actionParameter.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0)
+            if (this._devices.ContainsKey(actionParameter))
             {
-                return key;
+                return actionParameter;
+            }
+
+            foreach (var key in this._devices.Keys)
+            {
+                if (actionParameter.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return key;
+                }
             }
         }
 

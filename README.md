@@ -16,8 +16,11 @@ The plugin contributes the following actions (group **Audio**):
 | Action | Type | What it does |
 | --- | --- | --- |
 | **Audio Output** / **Audio Input** | Button | Pick one specific device in the action editor; pressing the button makes that device the default. |
+| **Audio Output Devices** / **Audio Input Devices** | Dynamic buttons | Assign a specific device's generated action. These use the SDK's device image callback and show the live active-device checkmark on the button image. |
 | **Cycle Audio Output** / **Cycle Audio Input** | Button | One-touch switch to the *next* active device. The button label shows the currently active device. |
 | **Audio Output (Dial)** / **Audio Input (Dial)** | Dial | Rotate to cycle through devices forwards/backwards. The dial value shows the currently active device. |
+
+> **Physical-display badge:** existing **Audio Output** / **Audio Input** Action Editor assignments remain compatible and keep their saved artwork. The SDK documents the image callback on **Audio Output Devices** / **Audio Input Devices** as the hardware-facing rendering path; replace an old assignment with the corresponding per-device dynamic action when the physical checkmark is needed. Dynamic actions use a plugin-generated device-name tile and do not inherit the legacy button's custom icon. The software preview of an Action Editor button alone does not confirm what the hardware received.
 
 > **Note on the active-device label:** the Cycle and Dial actions update their label after *you*
 > use them. If the default device is changed elsewhere (Windows sound settings or another app),
@@ -54,6 +57,15 @@ The plugin contributes the following actions (group **Audio**):
 Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download) and the `logiplugintool`
 command-line tool (installed with the Logi Plugin Service). The script builds, stages, packs
 and verifies `AudioSwitcher_<version>.lplug4`.
+
+To increment the patch version and build the next package (for example, `1.2.29` to `1.2.30`):
+
+```powershell
+.\build.ps1 -BumpPatch
+```
+
+The bumped version is applied consistently to the package manifest and .NET assembly metadata
+only after the new package passes verification. A plain `.\build.ps1` builds the current version.
 
 ## License
 

@@ -15,10 +15,12 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
     // ── State ────────────────────────────────────────────────────────────────
     private readonly Timer _refreshTimer;
     private volatile String _lastDefaultKey;
+    private Int32 _refreshInProgress;
+    private Int32 _imageRefreshPending;
 
-    // The profile arrives after the plugin during Windows startup. Retry briefly
-    // until a saved action image has actually been refreshed.
-    private Int32 _startupRefreshAttemptsRemaining = 20;
+    // The profile can arrive after the plugin during Windows startup. Keep the short
+    // warm-up window even if another saved profile was found first.
+    private Int32 _startupRefreshAttemptsRemaining = 40;
 
     protected AudioSwitchCommandBase(String displayName, String description)
         : base(DeviceType.All)
@@ -50,12 +52,8 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
 
     protected override Boolean OnLoad()
     {
-        PluginLog.Info($"{this.DisplayName} OnLoad");
-        this._lastDefaultKey = this.ReadDefaultDeviceKey();
-        if (!String.IsNullOrEmpty(this._lastDefaultKey))
-        {
-            ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, this._lastDefaultKey);
-        }
+        PluginLog.Info($"{this.DisplayName} OnLoad: Initializing audio device state");
+        this.SynchronizeActiveDevice(this.ReadDefaultDeviceKey());
 
         this._startupRefreshAttemptsRemaining = 40;
         this._refreshTimer.Change(100, 250);
@@ -73,6 +71,11 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
 
     private void OnTimerTick(Object state)
     {
+        if (Interlocked.Exchange(ref this._refreshInProgress, 1) != 0)
+        {
+            return;
+        }
+
         try
         {
             if (this.Plugin == null)
@@ -80,21 +83,19 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
                 return;
             }
 
+            if (Volatile.Read(ref this._imageRefreshPending) != 0)
+            {
+                this.TryNotifyImageChanged();
+            }
+
             var currentKey = this.ReadDefaultDeviceKey();
 
             if (this._startupRefreshAttemptsRemaining > 0)
             {
                 this._startupRefreshAttemptsRemaining--;
-                var synchronized = !String.IsNullOrEmpty(currentKey) &&
-                                   ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, currentKey);
-                var notified = this.TryNotifyImageChanged();
+                this.SynchronizeActiveDevice(currentKey);
 
-                if (!String.IsNullOrEmpty(currentKey))
-                {
-                    this._lastDefaultKey = currentKey;
-                }
-
-                if ((synchronized && notified) || this._startupRefreshAttemptsRemaining == 0)
+                if (this._startupRefreshAttemptsRemaining == 0)
                 {
                     this.CompleteStartupWarmup();
                 }
@@ -102,23 +103,38 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
                 return;
             }
 
-            // Steady-state: synchronize on every 1s tick so newly created actions,
-            // edited icons, and device changes are immediately reflected.
+            // Steady-state polling (1s): check if default device changed or profile actions were updated
             if (!String.IsNullOrEmpty(currentKey))
             {
                 var defaultChanged = !String.Equals(this._lastDefaultKey, currentKey, StringComparison.OrdinalIgnoreCase);
-                var synchronized = ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, currentKey);
-
-                if (defaultChanged || synchronized)
+                if (defaultChanged)
                 {
-                    this.TryNotifyImageChanged();
-                    this._lastDefaultKey = currentKey;
+                    this.SynchronizeActiveDevice(currentKey);
+                }
+                else
+                {
+                    // Periodically sync newly added/edited actions in profile
+                    ProfileImageBadgeSynchronizer.Synchronize(
+                        this.DataFlow,
+                        currentKey,
+                        onDeviceMatched: (actionParams, isCurrent) =>
+                        {
+                            this.SetDeviceState(actionParams, isCurrent ? 1 : 0);
+                        },
+                        onActionImagesChanged: () =>
+                        {
+                            this.TryNotifyImageChanged();
+                        });
                 }
             }
         }
         catch (Exception ex)
         {
             PluginLog.Error(ex, $"Default device polling failed: {ex.Message}");
+        }
+        finally
+        {
+            Volatile.Write(ref this._refreshInProgress, 0);
         }
     }
 
@@ -159,6 +175,19 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
 
     // ── Command execution ────────────────────────────────────────────────────
 
+    private static readonly Object CommandLock = new();
+    private static DateTime _lastCommandTime = DateTime.MinValue;
+    private static String _lastCommandTarget = null;
+
+    // Cache real ActionEditorActionParameters objects received from Loupedeck's
+    // GetCommandImage callbacks. These are the EXACT internal objects Loupedeck
+    // uses for GetHashCode64() lookups in its MultistateActionEditorCommand.f
+    // dictionary. Calling SetCurrentState() with these objects guarantees the
+    // correct hash slot is updated, whereas synthesized params may produce a
+    // different hash if StringDictionaryNoCase internal ordering differs.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<String, ActionEditorActionParameters>
+        _cachedRealParams = new(StringComparer.OrdinalIgnoreCase);
+
     protected override Boolean RunCommand(ActionEditorActionParameters actionParameters)
     {
         if (!actionParameters.TryGetString(DeviceControlName, out var deviceId))
@@ -166,25 +195,69 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
             return false;
         }
 
-        try
+        // Cache the real Loupedeck-internal ActionEditorActionParameters object
+        // for this device so we can call SetCurrentState on the exact object
+        // Loupedeck uses for its hash-based state lookup.
+        this._cachedRealParams[deviceId] = actionParameters;
+
+        // Fast-click guard: if already the current active device, acknowledge immediately
+        if (!String.IsNullOrEmpty(this._lastDefaultKey) &&
+            String.Equals(this._lastDefaultKey, deviceId, StringComparison.OrdinalIgnoreCase))
         {
-            PluginLog.Info($"RunCommand executing for device: {deviceId}");
-            if (AudioDeviceManager.SetDefault(deviceId))
+            PluginLog.Info($"Device '{deviceId}' is already active default; ignoring redundant switch.");
+            this.ApplyCachedStateUpdates(deviceId);
+            this.SynchronizeActiveDevice(deviceId);
+            return true;
+        }
+
+        lock (CommandLock)
+        {
+            // Debounce: ignore rapid duplicate switches to the same target within 300ms
+            var now = DateTime.UtcNow;
+            if (String.Equals(_lastCommandTarget, deviceId, StringComparison.OrdinalIgnoreCase) &&
+                (now - _lastCommandTime).TotalMilliseconds < 300)
             {
-                this._lastDefaultKey = deviceId;
-                this.SetCurrentState(actionParameters, 1);
-                ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, deviceId);
-                this.TryNotifyImageChanged();
+                PluginLog.Info($"Debouncing rapid switch for device: {deviceId}");
                 return true;
             }
 
-            PluginLog.Warning($"Device not found or switch failed: {deviceId}");
-            return false;
+            _lastCommandTime = now;
+            _lastCommandTarget = deviceId;
+
+            try
+            {
+                PluginLog.Info($"RunCommand executing for device: {deviceId}");
+                if (AudioDeviceManager.SetDefault(deviceId))
+                {
+                    // Immediately update Loupedeck's software UI using the real
+                    // internal params objects (bypasses hash-guess via synthesized params).
+                    this.ApplyCachedStateUpdates(deviceId);
+                    this.SynchronizeActiveDevice(deviceId);
+                    return true;
+                }
+
+                PluginLog.Warning($"Device not found or switch failed: {deviceId}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error(ex, $"Switch failed: {ex.Message}");
+                return false;
+            }
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>
+    /// Applies state 1 to the newly active device and state 0 to all other cached
+    /// devices using Loupedeck's real internal ActionEditorActionParameters objects.
+    /// This ensures the software UI badge updates immediately after a button press.
+    /// </summary>
+    private void ApplyCachedStateUpdates(String activeDeviceId)
+    {
+        foreach (var pair in this._cachedRealParams)
         {
-            PluginLog.Error(ex, $"Switch failed: {ex.Message}");
-            return false;
+            var isActive = String.Equals(pair.Key, activeDeviceId, StringComparison.OrdinalIgnoreCase);
+            this.SetDeviceState(pair.Value, isActive ? 1 : 0);
         }
     }
 
@@ -203,6 +276,15 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
                             actionParameters.TryGetString(DeviceControlName, out deviceId) &&
                             !String.IsNullOrEmpty(deviceId);
 
+            // Cache the real Loupedeck-internal params object so RunCommand can
+            // later call SetCurrentState on the exact object Loupedeck's hash
+            // dictionary uses. This is the primary capture point — GetCommandImage
+            // is called for every button render with the real internal object.
+            if (hasDevice)
+            {
+                this._cachedRealParams[deviceId] = actionParameters;
+            }
+
             // The timer owns Windows device detection. Rendering uses its last known
             // value so Loupedeck image callbacks do not fan out concurrent COM calls.
             var isCurrentDefault = hasDevice && String.Equals(
@@ -219,18 +301,47 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
                 this.SetCurrentState(actionParameters, renderStateIndex);
             }
 
-            var baseImage = base.GetCommandImage(actionParameters, renderStateIndex, imageWidth, imageHeight)
-                         ?? base.GetCommandImage(actionParameters, 0, imageWidth, imageHeight);
-            var displayName = this.GetCommandDisplayName(actionParameters, renderStateIndex);
+            var configuredBadgePosition = this.ResolveBadgePosition(actionParameters);
             var badgePosition = renderStateIndex == 1
-                ? this.ResolveBadgePosition(actionParameters)
+                ? configuredBadgePosition
                 : BadgePosition.None;
 
+            // Automatic badges use the clean inactive artwork as their base. Manual two-state
+            // actions (BadgePosition.None) keep their authored active image unchanged.
+            var imageStateIndex = badgePosition == BadgePosition.None ? renderStateIndex : 0;
+            var baseImageBytes = hasDevice
+                ? ProfileImageBadgeSynchronizer.GetCommandImageBytes(
+                    this.DataFlow,
+                    deviceId,
+                    configuredBadgePosition,
+                    imageStateIndex)
+                : null;
+
+            if (baseImageBytes == null && hasDevice)
+            {
+                // Populate the in-memory image cache if the host requested a tile before OnLoad
+                // completed. We MUST pass the real Windows-default key (_lastDefaultKey) so that
+                // the synchronizer correctly marks isCurrentDevice for every button, not just the
+                // one currently being rendered.  Using deviceId here would treat the rendered
+                // button as if it were active, corrupting the cache for all other buttons.
+                var currentDefaultForSync = this._lastDefaultKey ?? deviceId;
+                ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, currentDefaultForSync);
+                baseImageBytes = ProfileImageBadgeSynchronizer.GetCommandImageBytes(
+                    this.DataFlow,
+                    deviceId,
+                    configuredBadgePosition,
+                    imageStateIndex);
+            }
+
+            var baseImage = baseImageBytes == null
+                ? base.GetCommandImage(actionParameters, imageWidth, imageHeight)
+                : null;
+
             return AudioDeviceSwitchImage.BuildCommandButtonImage(
-                displayName,
+                String.Empty,
                 renderStateIndex,
                 baseImage,
-                null,
+                baseImageBytes,
                 imageWidth,
                 imageHeight,
                 badgePosition);
@@ -244,12 +355,49 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
 
     protected override String GetCommandDisplayName(
         ActionEditorActionParameters actionParameters,
-        Int32 stateIndex)
-    {
-        return String.Empty;
-    }
+        Int32 stateIndex) => String.Empty;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    public void SetDeviceState(ActionEditorActionParameters actionParameters, Int32 stateIndex)
+    {
+        try
+        {
+            this.SetCurrentState(actionParameters, stateIndex);
+        }
+        catch (Exception ex)
+        {
+            PluginLog.Warning(ex, $"Failed to set device state to {stateIndex}");
+        }
+    }
+
+    private Boolean SynchronizeActiveDevice(String currentKey)
+    {
+        if (String.IsNullOrEmpty(currentKey))
+        {
+            return false;
+        }
+
+        this._lastDefaultKey = currentKey;
+
+        // Synchronize saved profile action states. Button art and Icon Editor templates remain
+        // owned by the SDK/editor.
+        var synchronized = ProfileImageBadgeSynchronizer.Synchronize(
+            this.DataFlow,
+            currentKey,
+            onDeviceMatched: (actionParams, isCurrent) =>
+            {
+                this.SetDeviceState(actionParams, isCurrent ? 1 : 0);
+            });
+
+        // Also update via the real Loupedeck-internal ActionEditorActionParameters objects
+        // (captured from GetCommandImage callbacks). This guarantees the software UI badge
+        // updates correctly even if the synthesized params above produced a different hash.
+        this.ApplyCachedStateUpdates(currentKey);
+
+        this.TryNotifyImageChanged();
+        return synchronized;
+    }
 
     private String ReadDefaultDeviceKey() => AudioDeviceManager.GetDefaultDevice(this.DataFlow)?.Key;
 
@@ -270,11 +418,14 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
         try
         {
             this.ActionImageChanged();
+            AudioSwitcherPlugin.NotifySoftwareUiImagesChanged();
+            Volatile.Write(ref this._imageRefreshPending, 0);
             return true;
         }
         catch (NullReferenceException)
         {
             // SDK has no image-change subscriber yet while the profile is still loading.
+            Volatile.Write(ref this._imageRefreshPending, 1);
             return false;
         }
     }
@@ -283,19 +434,7 @@ public abstract class AudioSwitchCommandBase : MultistateActionEditorCommand
     {
         if (actionParameters != null && actionParameters.TryGetString(LayoutControlName, out var lv))
         {
-            return lv.ToLowerInvariant() switch
-            {
-                "top-center"    => BadgePosition.TopCenter,
-                "top-left"      => BadgePosition.TopLeft,
-                "middle-right"  => BadgePosition.MiddleRight,
-                "center"        => BadgePosition.Center,
-                "middle-left"   => BadgePosition.MiddleLeft,
-                "bottom-right"  => BadgePosition.BottomRight,
-                "bottom-center" => BadgePosition.BottomCenter,
-                "bottom-left"   => BadgePosition.BottomLeft,
-                "none"          => BadgePosition.None,
-                _               => BadgePosition.TopRight,
-            };
+            return AudioDeviceSwitchImage.ParseBadgePosition(lv);
         }
 
         return BadgePosition.TopRight;

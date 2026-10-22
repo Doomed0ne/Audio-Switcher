@@ -30,7 +30,7 @@ internal struct PropertyKey
     }
 }
 
-[StructLayout(LayoutKind.Explicit, Size = 16)]
+[StructLayout(LayoutKind.Explicit)]
 internal struct PropVariant
 {
     private const UInt16 VtLpwstr = 31;
@@ -38,8 +38,20 @@ internal struct PropVariant
     [FieldOffset(0)]
     public UInt16 ValueType;
 
+    [FieldOffset(2)]
+    public UInt16 Reserved1;
+
+    [FieldOffset(4)]
+    public UInt16 Reserved2;
+
+    [FieldOffset(6)]
+    public UInt16 Reserved3;
+
     [FieldOffset(8)]
     public IntPtr PointerValue;
+
+    [FieldOffset(16)]
+    public Int64 Int64Padding; // Guarantees 24 bytes total struct size on 64-bit Windows
 
     public readonly String GetString() =>
         this.ValueType == VtLpwstr && this.PointerValue != IntPtr.Zero

@@ -79,6 +79,8 @@ internal static class AudioDeviceManager
         return match.Key != null && String.Equals(match.Key, current.Key, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static readonly Object SwitchLock = new();
+
     public static Boolean SetDefault(String deviceKey)
     {
         if (String.IsNullOrEmpty(deviceKey))
@@ -86,21 +88,24 @@ internal static class AudioDeviceManager
             return false;
         }
 
-        return RunOnStaThread(() =>
+        lock (SwitchLock)
         {
-            var endpoint = Enumerate(EDataFlow.All)
-                .Where(e => String.Equals(e.Key, deviceKey, StringComparison.OrdinalIgnoreCase))
-                .Select(e => (Endpoint?)e)
-                .FirstOrDefault();
-
-            if (endpoint is not { } match)
+            return RunOnStaThread(() =>
             {
-                PluginLog.Warning($"No active audio device matches id: {deviceKey}");
-                return false;
-            }
+                var endpoint = Enumerate(EDataFlow.All)
+                    .Where(e => String.Equals(e.Key, deviceKey, StringComparison.OrdinalIgnoreCase))
+                    .Select(e => (Endpoint?)e)
+                    .FirstOrDefault();
 
-            return SetDefaultEndpoint(match.EndpointId);
-        });
+                if (endpoint is not { } match)
+                {
+                    PluginLog.Warning($"No active audio device matches id: {deviceKey}");
+                    return false;
+                }
+
+                return SetDefaultEndpoint(match.EndpointId);
+            });
+        }
     }
 
     public static Boolean CycleInDirection(EDataFlow flow, Int32 direction) =>
@@ -172,23 +177,37 @@ internal static class AudioDeviceManager
     private static Endpoint? GetDefaultEndpoint(EDataFlow flow)
     {
         IMMDeviceEnumerator enumerator = null;
-        IMMDevice device = null;
         try
         {
             enumerator = (IMMDeviceEnumerator)CreateComObject(NativeMethods.CLSID_MMDeviceEnumerator);
 
-            var hr = enumerator.GetDefaultAudioEndpoint(flow, ERole.Console, out device);
-            if (hr == NativeMethods.E_NOTFOUND || device == null)
+            // Console is the system-control role used by this plugin's device switcher. Some
+            // Windows configurations expose a default only for Multimedia or Communications;
+            // fall through in that case instead of treating an available endpoint as no device.
+            foreach (var role in new[] { ERole.Console, ERole.Multimedia, ERole.Communications })
             {
-                return null;
+                IMMDevice device = null;
+                try
+                {
+                    var hr = enumerator.GetDefaultAudioEndpoint(flow, role, out device);
+                    if (hr == NativeMethods.E_NOTFOUND || device == null)
+                    {
+                        continue;
+                    }
+
+                    Marshal.ThrowExceptionForHR(hr);
+                    return ReadEndpoint(device);
+                }
+                finally
+                {
+                    Release(device);
+                }
             }
 
-            Marshal.ThrowExceptionForHR(hr);
-            return ReadEndpoint(device);
+            return null;
         }
         finally
         {
-            Release(device);
             Release(enumerator);
         }
     }
@@ -285,8 +304,13 @@ internal static class AudioDeviceManager
             }
         });
         thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
         thread.Start();
-        thread.Join();
+        if (!thread.Join(5000))
+        {
+            PluginLog.Warning("Audio device operation timed out after 5000ms.");
+            return false;
+        }
         return result;
     }
 
@@ -296,7 +320,13 @@ internal static class AudioDeviceManager
     {
         if (comObject != null && Marshal.IsComObject(comObject))
         {
-            Marshal.FinalReleaseComObject(comObject);
+            try
+            {
+                Marshal.ReleaseComObject(comObject);
+            }
+            catch
+            {
+            }
         }
     }
 }

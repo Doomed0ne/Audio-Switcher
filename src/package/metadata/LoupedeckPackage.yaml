@@ -18,7 +18,7 @@ description: Switch audio devices and control per-app volume with the Volume Mix
 pluginFileName: AudioSwitcherPlugin.dll
 
 # Plugin version.
-version: 1.2.27
+version: 1.2.43
 
 # Author of the plugin. The author can be a company or an individual developer.
 author: Joel Friesecke

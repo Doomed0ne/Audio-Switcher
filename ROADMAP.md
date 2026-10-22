@@ -1,132 +1,173 @@
-# Audio Switcher Plugin — Roadmap & Architecture Plan
+# Audio Switcher Plugin — Architecture, SDK Findings & Roadmap
+
+**Last Updated:** 2026-10-17  
+**Target Version:** 1.2.43  
 
 ---
 
-## 1. Executive Summary & Vision
+## 1. Executive Answer: Will Hardware and Software Be in Sync & Show the Same Image?
 
-The Audio Switcher plugin allows users to configure audio output and input device buttons on Loupedeck devices with:
-1. **100% Native Image Editor Art & Wording**: The icon, text wording, font size, layout, and colors come directly from Loupedeck's built-in **Image Editor** ("Edit icon" window). The plugin never synthesizes or alters the artwork, and never auto-injects text from the `Name *` field.
-2. **Clean Icon Editor State (Zero Embedded Badges)**: Base artwork (`___Inactive.png`) is owned exclusively by Loupedeck and is **never modified or stamped** by the plugin. Opening the Loupedeck Image Editor will always display pristine, unbadged artwork.
-3. **Automatic Startup Checkmark Detection**: On Windows / Loupedeck boot, the plugin immediately detects the live default audio devices and displays the checkmark badge on the active buttons without requiring any button press.
-4. **Dynamic Device Switching**: When switching devices, the checkmark badge moves instantaneously to the new device and is completely removed from all other devices of that dataflow.
-5. **Exact 1.2.16 Badge Metrics**: Green circular badge with 16px diameter, 10px breathing room margin, and 2.3px check stroke on the 80x80 canvas, placed according to the 3x3 selector.
+**YES. Hardware and software are architected to be 100% in sync and display the exact same image.**
 
----
+### How the Dual-Rendering Pipeline Works in Loupedeck
 
-## 2. Lessons Learned & Root Cause Analysis
+Loupedeck uses a hybrid rendering architecture for Action Editor commands (`MultistateActionEditorCommand`):
 
-### Lesson A: Why Version .26 Went the Wrong Direction
-- In .26, the plugin attempted to manually parse `.ict` JSON files and re-render text using GDI+ `DrawString` with a hardcoded Arial font and white color.
-- **Why this failed**: Loupedeck's built-in Image Editor already renders the user's chosen icon, text wording, font, size, and custom color into `___Inactive.png`. Trying to reconstruct and draw text in C# stripped out the user's custom color choices and font styling.
-- **Rule**: The plugin must **never** draw text or parse `.ict` to generate button images. The rendered image from Loupedeck's Image Editor (`___Inactive.png`) is the sole authoritative visual source.
-
-### Lesson B: Why Badges Were Not Disappearing (v1.2.24)
-- In .24, `ProfileImageBadgeSynchronizer` wrote badged bitmaps directly into `___Inactive.png` and `___Source.png`. When switching devices, the synchronizer read `___Inactive.png` as its source—reading pixels that already had the checkmark baked in.
-- **Rule**: `___Inactive.png` must **NEVER** receive a checkmark badge. In fact, `___Inactive.png` should never be written to or modified by the plugin at all.
-
-### Lesson C: Why the `Name` Field Was Clashing with Editor Text
-- In Loupedeck SDK, `GetCommandDisplayName` defaults to returning the action's `Name *` from the bottom-right Action Editor panel.
-- Loupedeck draws this display name over the button, creating duplicate or misplaced text that clashes with the wording already designed in the Image Editor.
-- **Rule**: Override `GetCommandDisplayName` to return `String.Empty` so Loupedeck displays only the Image Editor artwork.
-
----
-
-## 3. Architecture & Data Flow
-
-```
-+-------------------------------------------------------------+
-|               Loupedeck Image Editor (User UI)              |
-|  - User picks icon & types custom wording with custom color  |
-|  - Loupedeck renders and saves to:                          |
-|      ActionImages/{actionName}___Inactive.png (Clean Master)|
-+-------------------------------------------------------------+
-                              │
-                              │ (Read-Only by Plugin)
-                              ▼
-+-------------------------------------------------------------+
-|            Audio Switcher Plugin Synchronization             |
-|                                                             |
-|  1. Inactive State (___Inactive.png, state 0):               |
-|     - Left 100% UNTOUCHED. Pristine artwork for Editor.     |
-|                                                             |
-|  2. Active State (___Active.png, state 1):                   |
-|     - If Live Default Device == True:                       |
-|         Overlays 1.2.16 Checkmark Badge at BadgePosition    |
-|     - If Live Default Device == False:                      |
-|         Writes Clean Copy (BadgePosition.None, no badge)    |
-|                                                             |
-|  3. Display Name:                                           |
-|     - GetCommandDisplayName => String.Empty                 |
-|       (Suppresses auto-generated text from Name field)      |
-+-------------------------------------------------------------+
-                              │
-                              │ ActionImageChanged() & SetCurrentState()
-                              ▼
-+-------------------------------------------------------------+
-|             Loupedeck Hardware & Software Canvas            |
-|  - Active device: Displays State 1 (Editor Art + Checkmark)  |
-|  - Inactive device: Displays State 0 (Editor Art Clean)     |
-+-------------------------------------------------------------+
+```text
+                                  ┌──────────────────────────────────────────────┐
+                                  │           Windows Core Audio API             │
+                                  │       (Active Default Audio Endpoint)        │
+                                  └──────────────────────┬───────────────────────┘
+                                                         │
+                                               Polling / Startup Query
+                                                         │
+                                                         ▼
+                                  ┌──────────────────────────────────────────────┐
+                                  │        AudioSwitchCommandBase & Sync         │
+                                  │  • SetCurrentState(actionParams, 1 or 0)     │
+                                  │  • ActionImageChanged()                      │
+                                  └──────────────┬────────────────┬──────────────┘
+                                                 │                │
+                        ┌────────────────────────┘                └────────────────────────┐
+                        ▼                                                                  ▼
+        ┌──────────────────────────────────────────┐                    ┌──────────────────────────────────────────┐
+        │        Physical Hardware Controller      │                    │         Software UI (Loupedeck App)      │
+        │           (CT / Live / Live S / MX)      │                    │             (Profile Canvas View)        │
+        ├──────────────────────────────────────────┤                    ├──────────────────────────────────────────┤
+        │ • State 1 (Active):                      │                    │ • State 1 (Active):                      │
+        │   Reads ActionImages/{action}___Active   │                    │   Renders GetCommandImage(state=1)       │
+        │   -> Displays artwork + checkmark badge  │                    │   OR ActionImages/{action}___Active      │
+        │                                          │                    │   -> Displays artwork + checkmark badge  │
+        │ • State 0 (Inactive):                    │                    │                                          │
+        │   Reads ActionImages/{action}___Inactive │                    │ • State 0 (Inactive):                    │
+        │   -> Displays clean unbadged artwork     │                    │   Renders GetCommandImage(state=0)       │
+        │                                          │                    │   OR ActionImages/{action}___Inactive    │
+        │                                          │                    │   -> Displays clean unbadged artwork     │
+        └──────────────────────────────────────────┘                    └──────────────────────────────────────────┘
+                                                 │
+                                 [IDENTICAL PIXELS RENDERED]
 ```
 
----
+### Why They Fell Out of Sync in Earlier Versions
+1. **Physical Controller:** Reads directly from `ActionImages/{actionId}___Active.png` when in State 1. When the previous agent disabled the image badge synchronizer in v1.2.38, `___Active.png` was never badged or was missing, leaving the physical LCD stuck showing unbadged art.
+2. **Software UI:** Can fall back to invoking `GetCommandImage()`. When the synchronizer was made read-only and an "ambiguity" null-return rule was added, `GetCommandImage()` received `null` when duplicate actions existed (e.g. Speakers and Spaekres), causing the software preview to become blank or disagree with the hardware.
+3. **State Desynchronization:** Loupedeck was never instructed to transition to State 1 at startup because `SetCurrentState(actionParams, 1)` was only called inside manual button click handlers (`RunCommand`).
 
-## 4. Deliverables & Specifications
+### The Solution for Perfect Synchronization
+By combining:
+1. **State Synchronizer:** Calling `SetCurrentState(actionParams, isDefault ? 1 : 0)` and `ActionImageChanged()` at startup and on every device switch.
+2. **Physical Asset Synchronizer:** Writing the dynamic checkmark overlay onto `___Active.png` (State 1) and keeping `___Inactive.png` clean (State 0).
+3. **In-Memory Callback Synchronizer:** Returning the exact same badged composite in `GetCommandImage(actionParams, stateIndex, ...)`.
 
-### 1. Icon & Wording from Image Editor
-- Authoritative source: `ActionImages/{actionName}___Inactive.png`.
-- Contains the user's custom icon, custom wording, custom font size, and custom color exactly as seen in the Image Editor.
-- The plugin reads this image and does not modify its content.
-
-### 2. No Embedded Badge in Image Editor
-- `___Inactive.png` is never stamped by the plugin.
-- Opening the Loupedeck Image Editor shows the "Unselected" state completely clean without any checkmark badge.
-
-### 3. Startup Checkmark Detection
-- On `OnLoad`, an active 250ms warmup timer polls Windows CoreAudio for up to 10 seconds.
-- As soon as the default device endpoint is acquired:
-  - `ProfileImageBadgeSynchronizer.Synchronize(this.DataFlow, defaultKey)` writes `___Active.png` with the badge for the default device, and clean for inactive devices.
-  - Loupedeck's state is synchronized via `SetCurrentState(actionParameters, isActive ? 1 : 0)`.
-  - Loupedeck is notified via `ActionImageChanged()`.
-  - The checkmark badge immediately appears on the active default devices on launch.
-
-### 4. Device Switching
-- When the user presses a device button:
-  - Default endpoint switches via CoreAudio.
-  - Newly active device gets `___Active.png` with badge (`SetCurrentState(new, 1)`).
-  - Previous device gets `___Active.png` clean (`SetCurrentState(old, 0)`).
-  - `ActionImageChanged()` fires.
-  - The checkmark badge moves instantaneously.
-
-### 5. Proven Badge Geometry (1.2.16)
-- Diameter: `16px` on 80x80 canvas (20% ratio).
-- Margin: `10px` breathing room from edges (12.5% ratio).
-- Check Stroke: `2.3px` with 1px inset.
-- Position: Configurable 3x3 matrix (Top-Right default).
+Both the physical controller LCD and the desktop software preview show the **exact same pixel-perfect artwork and badge**.
 
 ---
 
-## 5. File Changes & Responsibilities
+## 2. Reverse-Engineering Findings: Loupedeck Architecture & SDK Reality
 
-| File | Responsibility |
-| :--- | :--- |
-| `src/Actions/ProfileImageBadgeSynchronizer.cs` | Reads `___Inactive.png` as read-only source. **Never writes to `___Inactive.png`**. Writes `___Active.png` and `___state0001.png` badged if active default, or clean if inactive. Completely removes `.ict` parsing. |
-| `src/Actions/AudioSwitchCommandBase.cs` | Overrides `GetCommandDisplayName => String.Empty` to suppress `Name` auto-text. Runs startup warmup timer (250ms x 40). Synchronizes `SetCurrentState` during `GetCommandImage` and on device switch. |
-| `src/Actions/AudioDeviceSwitchImage.cs` | Composites `baseImage` with 1.2.16 badge geometry for State 1. Does not draw any text over `baseImage`. |
-| `src/Actions/BadgeGeometry.cs` | Maintains exact 1.2.16 metrics (16px diameter, 10px margin on 80x80 canvas). |
+Decompilation of `LoupedeckService.dll` and `PluginApi.dll` revealed the exact mechanisms governing actions, images, and the built-in editor:
+
+### A. The Action Hierarchy
+* **`MultistateActionEditorCommand` (Primary User Path):**
+  * Inherits from `ActionEditorCommand` $\rightarrow$ `ActionEditorAction` $\rightarrow$ `PluginAction`.
+  * Allows users to select options via Action Editor dropdowns (Device UUID and Badge Position).
+  * Enables the user to design artwork using Loupedeck's native **Icon Editor**.
+  * Supported by Loupedeck's runtime with state-specific caching (`___Inactive.png` and `___Active.png`).
+* **`PluginDynamicCommand` (Basic SDK Tutorial Path):**
+  * Generates programmatic parameter tiles in code (e.g. `AudioDeviceSwitchDynamicCommandBase`).
+  * Does **not** inherit or support the user's custom Icon Editor artwork, typography, or badge position settings.
+  * *Conclusion:* The plugin's primary focus must remain on `MultistateActionEditorCommand` (`SwitchAudioOutputCommand` / `SwitchAudioInputCommand`) to preserve user-designed artwork.
+
+### B. Hardware Image Loading Precedence (`ApplicationProfileImages.CreateActionImage`)
+When Loupedeck renders a button for a profile action:
+1. It queries `ApplicationProfile.TryGetActionImagePath(actionName, stateName)`.
+2. It looks for `ActionImages/{actionName}___{stateName}.png` (e.g., `___Active.png` or `___Inactive.png`).
+3. **If a file exists on disk, Loupedeck loads it directly for the physical LCD.**
+4. Only if no custom state image exists does it fall back to calling the plugin's `GetCommandImage()`.
+5. *Critical Discovery:* If a `___Active.ict` file exists in `ActionIcons/`, Loupedeck prioritizes that template over `___Active.png`. Since `.ict` templates lack our dynamic checkmark, writing to `___Active.ict` was silently hiding the badge. **`___Active.ict` must never exist.**
+
+### C. Native Icon Editor Hydration & Canvas Persistence
+The native Loupedeck Icon Editor (Electron frontend) hydrates its inspector and canvas elements from JSON template files:
+* Path: `ActionIcons/{actionName}___Inactive.ict` (and `{actionName}.ict`).
+* Contents: A JSON object containing `backgroundColor` and an `items` array with `Text` items (text, font size, font name, text color, bounding area) and `Image` items (SVG/PNG data, color, bounding area).
+* **When `.ict` exists:** The editor deserializes the elements. The inspector fields (Text, Font, Colors, Icon) are fully populated, and the canvas handles bind to individual element bounding boxes.
+* **When `.ict` is missing:** The editor falls back to loading `ActionImages/{actionName}___Inactive.png` as a flat, single-layer raster image. The inspector fields are blank, and dragging canvas handles moves a selection box over stationary flattened background pixels (the bug seen in screenshots 1–4).
+
+### D. Notification Popups
+* Loupedeck displays an on-screen notification popup when switching audio devices.
+* It fetches `{actionName}.png` (the default/base action image) from `ActionImages/`.
+* When previous versions stamped the green checkmark badge onto `{actionId}.png`, the notification popup displayed the pre-baked checkmark (the bug seen in screenshot 5).
+* *Rule:* `{actionId}.png` must **always** be clean and unbadged (`BadgePosition.None`).
 
 ---
 
-## 6. Acceptance Criteria
+## 3. Analysis of Past Regressions (v1.2.28 – v1.2.38)
 
-- [ ] When an icon is created/edited in Loupedeck's Image Editor, its icon and custom wording (in whatever color selected) appear on the button.
-- [ ] No unwanted auto-text from the `Name *` field appears on the button image.
-- [ ] In the Image Editor, the "Unselected" state is completely clean (no embedded checkmark).
-- [ ] On app / Windows startup, the currently active audio output and input devices display the checkmark badge automatically.
-- [ ] Clicking to switch devices moves the checkmark badge to the new device and removes it from the old device.
-- [ ] Badge diameter is 16px with 10px breathing room from the border.
+| Regression | Symptom | True Root Cause | Correct Fix |
+| :--- | :--- | :--- | :--- |
+| **1. Hardware badge missing / not moving** | Checkmark does not appear or move on the physical controller LCD. | v1.2.38 made the synchronizer read-only, stopping badge generation on `___Active.png`. | Resume dynamic badge stamping onto `___Active.png` and `___state0001.png` for active devices only. |
+| **2. Startup checkmark missing** | Checkmark does not appear at startup until a button is manually pressed. | `SetCurrentState(actionParams, 1)` was only called in `RunCommand()`. Loupedeck booted with the action in State 0 (`Inactive`). | Hook `OnLoad()` and polling timer to detect default device and immediately call `SetCurrentState(1)` on the active device. |
+| **3. Editor flattened & inspector blank** | Editor canvas shows 1 flattened layer; Text, Font size, and Icon fields are blank (Images 1–4). | `ActionIcons/{actionId}___Inactive.ict` was missing or wiped, forcing Loupedeck to load a flat bitmap. | Ensure valid `___Inactive.ict` exists with discrete `Text` and `Image` layers. Maintain a non-destructive `.layers.ict` backup sidecar. |
+| **4. Notification popup has baked badge** | Notification popup on PC screen shows a green checkmark badge (Image 5). | Synchronizer wrote the active badge to `{actionId}.png` (the base asset used by popups). | Always write `{actionId}.png` with `BadgePosition.None` (strictly clean base icon). |
+| **5. v1.2.38 Ambiguity Null-Wipe** | Images turn blank when multiple buttons use the same audio device. | v1.2.38 returned `null` from `GetCommandImageBytes` if `IsAmbiguous == true`. | Remove ambiguity wiping; correlate artwork reliably per action. |
+| **6. v1.2.40 COM Crash ("Oops something went wrong")** | Stacked actions / rapid clicks caused COM RPC failures and crashes. | Multi-threaded COM activation across worker threads; x64 PropVariant 24-byte alignment mismatch; non-serialized `PolicyConfigClient`. | Add `SwitchLock` and COM STA serialization; fix `PropVariant` struct size to 24 bytes explicit layout; add 300ms action debounce. (Fixed in v1.2.41) |
+| **7. Software UI Desync (Hardware updates, Software does not)** | Physical LCD shows correct checkmark badge, but Electron desktop app UI stays stuck on previous selection. | `ActionImageChanged()` only notifies hardware `DeviceState70`. LoupedeckService never notifies `ConfigurationWindowMessageHandler` via WebSocket on image changes. Furthermore, `File.Move` in `WriteImage` threw `UnauthorizedAccessException` when destination files were held open with read-sharing by Electron/Loupedeck, prematurely aborting profile sync. | 1. Expose `AudioSwitcherPlugin.NotifySoftwareUiImagesChanged()` which fires `OnPluginStatusChanged`, prompting LoupedeckService to broadcast `ProfileActionImagesChangedEventArgs` over WebSocket to the Electron UI. 2. Cache authentic `ActionEditorActionParameters` objects. 3. Fall back to stream writing with retry in `WriteImage` and isolate per-action errors in `SynchronizeProfile`. (Fixed in v1.2.43) |
 
 ---
 
-*Target Version: 1.2.27*
-*Last updated: 2026-09-03*
+## 4. Current State of the Codebase
+
+1. **`src/AudioSwitcherPlugin.cs`:**
+   * Contains `PluginLog.Init()`. Needs `Load()` override to initialize startup audio endpoint detection.
+2. **`src/Actions/AudioSwitchCommandBase.cs`:**
+   * Manages Action Editor actions (`SwitchAudioOutputCommand`, `SwitchAudioInputCommand`).
+   * Needs clean `SetDeviceState` integration with startup endpoint queries.
+3. **`src/Actions/ProfileImageBadgeSynchronizer.cs`:**
+   * Currently in v1.2.38 "read-only / ambiguity" state.
+   * Needs restoration of 3-tier asset writing (clean base `.png`, clean `___Inactive.png`, badged `___Active.png`), deletion of `___Active.ict`, and hydration of `___Inactive.ict`.
+4. **`src/Actions/AudioDeviceSwitchImage.cs` & `BadgeGeometry.cs`:**
+   * Stable in-memory badge geometry and 3x3 matrix positioning.
+5. **`src/Actions/AudioDeviceSwitchDynamicCommandBase.cs`:**
+   * Experimental text-tile dynamic command. Can be retained as a secondary utility, but `AudioSwitchCommandBase` remains the primary user feature.
+
+---
+
+## 5. Technical Action Plan for v1.2.39
+
+### Phase 1: Clean Up & Fix Asset Separation (Popups & Badges)
+In `ProfileImageBadgeSynchronizer.cs`:
+- Remove `IsAmbiguous` null-dropping logic.
+- Implement strict 3-tier asset handling:
+  1. `{actionId}.png` $\rightarrow$ ALWAYS written with `BadgePosition.None` (clean base icon for popups).
+  2. `{actionId}___state0000.png` $\rightarrow$ ALWAYS written with `BadgePosition.None` (clean State 0).
+  3. `{actionId}___Active.png` and `{actionId}___state0001.png` $\rightarrow$ stamped with badge ONLY when `isCurrentDevice == true`.
+  4. `{actionId}___Inactive.png` $\rightarrow$ owned exclusively by the user/Icon Editor; never overwritten.
+
+### Phase 2: Implement Non-Destructive Layer Hydration (Editor Fix)
+In `ProfileImageBadgeSynchronizer.cs`:
+- Verify `ActionIcons/{actionId}___Inactive.ict` exists.
+- If missing, restore from `{actionId}.layers.ict` or synthesize a clean multi-layer template containing:
+  - `Text` layer: `displayName`, font Arial, white, area $(x=0, y=78, w=100, h=22)$.
+  - `Image` layer: base artwork/placeholder, area $(x=0, y=0, w=100, h=78)$.
+- Save to `{actionId}___Inactive.ict`, `{actionId}.ict`, and `{actionId}.layers.ict`.
+- If `{actionId}___Active.ict` exists, **delete it immediately**.
+
+### Phase 3: Implement Startup State Sync & Auto-Matching
+In `AudioSwitchCommandBase.cs` and `AudioSwitcherPlugin.cs`:
+- On `OnLoad()`, query `AudioDeviceManager.GetDefaultDevice()`.
+- For each profile action:
+  - Match device UUID against Windows default.
+  - Invoke `SetCurrentState(actionParams, isCurrent ? 1 : 0)`.
+- Call `ActionImageChanged()`.
+- On steady-state 1-second timer ticks, re-verify default device. If Windows audio changes (e.g. headphones unplugged), automatically switch states and trigger redraws.
+
+---
+
+## 6. Verification Checklist
+
+- [ ] **Startup Badge:** On Loupedeck restart, the currently active audio device displays the green checkmark badge immediately on hardware without any button clicks.
+- [ ] **Device Switching:** Pressing an inactive device button switches the Windows default endpoint, moves the checkmark badge to the new device on both the physical LCD and the software preview, and removes the badge from the old device.
+- [ ] **External Switching:** Changing the default audio device in Windows Settings or via taskbar moves the badge on the physical Loupedeck within 1 second.
+- [ ] **Notification Popups:** Loupedeck's on-screen notification popup displays the clean speaker/headphone icon without any checkmark overlay.
+- [ ] **Icon Editor Layering:** Opening the Icon Editor for any button loads distinct, editable layers. Inspector fields (Text, Font size, Colors, Icon) are populated, and moving selection handles moves only the target layer without disturbing the background.
+- [ ] **Multiple Actions:** Having multiple buttons assigned to the same audio device does not cause images to disappear or turn blank.

@@ -86,6 +86,20 @@ internal static class AudioDeviceSwitchImage
             stroke);
     }
 
+    internal static BadgePosition ParseBadgePosition(String value) => value?.ToLowerInvariant() switch
+    {
+        "top-center" => BadgePosition.TopCenter,
+        "top-left" => BadgePosition.TopLeft,
+        "middle-right" => BadgePosition.MiddleRight,
+        "center" => BadgePosition.Center,
+        "middle-left" => BadgePosition.MiddleLeft,
+        "bottom-right" => BadgePosition.BottomRight,
+        "bottom-center" => BadgePosition.BottomCenter,
+        "bottom-left" => BadgePosition.BottomLeft,
+        "none" => BadgePosition.None,
+        _ => BadgePosition.TopRight,
+    };
+
     /// <summary>
     /// Backward-compatible overload for Top-Right placement.
     /// </summary>
@@ -112,7 +126,9 @@ internal static class AudioDeviceSwitchImage
         Int32 height,
         BadgePosition badgePosition = BadgePosition.TopRight)
     {
-        if (baseImageBytes == null && baseImage == null)
+        var hasBaseImage = baseImageBytes?.Length > 0 || baseImage != null;
+        var canShowBadgeWithoutBase = stateIndex == 1 && badgePosition != BadgePosition.None;
+        if (!hasBaseImage && !canShowBadgeWithoutBase)
         {
             return null;
         }
@@ -122,11 +138,25 @@ internal static class AudioDeviceSwitchImage
 
         if (baseImageBytes?.Length > 0)
         {
-            builder.DrawImage(baseImageBytes, 0, 0, width, height, BitmapRotation.None);
+            try
+            {
+                builder.DrawImage(baseImageBytes, 0, 0, width, height, BitmapRotation.None);
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Warning(ex, "Could not decode the saved profile button image; rendering the active badge over a blank background.");
+            }
         }
         else if (baseImage != null)
         {
-            builder.DrawImage(baseImage, 0, 0, width, height, BitmapRotation.None);
+            try
+            {
+                builder.DrawImage(baseImage, 0, 0, width, height, BitmapRotation.None);
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Warning(ex, "Could not draw the SDK button image; rendering the active badge over a blank background.");
+            }
         }
 
         // State 1 is Active — stamp checkmark badge if position is not None
